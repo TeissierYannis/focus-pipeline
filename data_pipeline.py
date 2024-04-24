@@ -17,22 +17,22 @@ except ImportError as e:
 
 
 def setup_logger():
-    # Créer un logger
+    # Create a custom logger
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)  # Définir le niveau de log à DEBUG pour capturer tous les niveaux de messages
+    logger.setLevel(logging.DEBUG)  # Define the level of the logger to DEBUG
 
-    # Créer un gestionnaire de console
+    # Create handlers
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)  # Définir le niveau de log de ce handler à INFO
+    console_handler.setLevel(logging.INFO)  # Define the level of the handler to INFO
 
-    # Définir le format du log
+    # Define the format of the logs
     formatter = logging.Formatter(
         '[%(asctime)s][%(name)s][%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     console_handler.setFormatter(formatter)
 
-    # Ajouter le gestionnaire au logger
+    # Add handlers to the logger
     logger.addHandler(console_handler)
 
     return logger
