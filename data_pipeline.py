@@ -1,57 +1,104 @@
 import os
-import polars as pl
 import glob
 import logging
+import time
 
-# path to the input and output folder
-input_folder = "input"
-output_folder = "output"
-parquet_folder = os.path.join(output_folder, "parquet")
-dataset_folder = os.path.join(output_folder, "dataset")
+import pandas as pd
+import sqlite3
 
-# Check if focus-converter is installed
-try:
-    from focus_converter.main import FocusConverter, ProviderSensor, Validator
-except ImportError as e:
-    raise ImportError("focus-converter is not installed. Please install it using 'pip install focus-convert'") from e
+from focus_converter.converter import FocusConverter
+from focus_converter.data_loaders.provider_sensor import ProviderSensor
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 
-def setup_logger():
-    # Create a custom logger
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)  # Define the level of the logger to DEBUG
+class LoggerSetup:
+    @staticmethod
+    def setup_logger():
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
 
-    # Create handlers
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)  # Define the level of the handler to INFO
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
 
-    # Define the format of the logs
-    formatter = logging.Formatter(
-        '[%(asctime)s][%(name)s][%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    console_handler.setFormatter(formatter)
+        formatter = logging.Formatter(
+            '[%(asctime)s][%(name)s][%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler.setFormatter(formatter)
 
-    # Add handlers to the logger
-    logger.addHandler(console_handler)
-
-    return logger
+        logger.addHandler(console_handler)
+        return logger
 
 
-logger = setup_logger()
+class DatabaseManager:
+    def __init__(self, db_path='processed_files.db'):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS processed_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL UNIQUE
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS dataset (
+            id INTEGER PRIMARY KEY AUTOINCREMENT
+        )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def is_file_processed(self, file_name):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM processed_files WHERE file_name = ?', (file_name,))
+        result = cursor.fetchone()[0]
+        conn.close()
+        return result > 0
+
+    def mark_file_as_processed(self, file_name):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR IGNORE INTO processed_files (file_name) VALUES (?)', (file_name,))
+        conn.commit()
+        conn.close()
+
+    def add_missing_columns(self, df):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        df_columns = set(df.columns)
+        cursor.execute("PRAGMA table_info(dataset)")
+        existing_columns = set([row[1] for row in cursor.fetchall()])
+        missing_columns = df_columns - existing_columns
+
+        for column in missing_columns:
+            cursor.execute(f'ALTER TABLE dataset ADD COLUMN {column} TEXT')
+        conn.commit()
+        conn.close()
+
+    def store_in_db(self, df):
+        conn = sqlite3.connect(self.db_path)
+        self.add_missing_columns(df)
+        df.to_sql('dataset', conn, if_exists='append', index=False)
+        conn.close()
 
 
-def convert_csv_to_focus(input_folder, output_folder):
-    """
-    Convert all CSV files in input_folder to FOCUS format and save them in output_folder
-    :param input_folder: Source folder containing CSV files
-    :param output_folder: Destination folder to save FOCUS files
-    :return: None
-    """
-    logger.info(f"Converting CSV files in {input_folder} to FOCUS format and saving them in {output_folder}")
-    csv_files = glob.glob(os.path.join(input_folder, '*.csv'))
-    logger.info(f"Found {len(csv_files)} CSV files to convert")
-    for file_path in csv_files:
+class FocusConverterService:
+    def __init__(self, output_folder, db_manager):
+        self.output_folder = output_folder
+        self.db_manager = db_manager
+
+    def convert_csv_to_focus(self, file_path):
+        if self.db_manager.is_file_processed(file_path):
+            logger.info(f"File {file_path} has already been processed. Skipping.")
+            raise Exception(f"File {file_path} has already been processed. Skipping.")
+
+        logger.info(f"Converting CSV file {file_path} to FOCUS format and saving it in {self.output_folder}")
         try:
             provider_sensor = ProviderSensor(base_path=file_path)
             provider_sensor.load()
@@ -64,113 +111,113 @@ def convert_csv_to_focus(input_folder, output_folder):
                 parquet_data_format=provider_sensor.parquet_data_format,
             )
             converter.configure_data_export(
-                export_path=output_folder,
+                export_path=self.output_folder,
                 export_include_source_columns=True,
                 basename_template=None,
             )
             converter.prepare_horizontal_conversion_plan(provider=provider_sensor.provider)
             converter.convert()
             logger.info(f"File {file_path} converted successfully")
-
-            # Optional: Validate the output - Not working at the moment
-            """ 
-            for segment_file_name in os.listdir(output_folder):
-                segment_path = os.path.join(output_folder, segment_file_name)
-                validator = Validator(
-                    data_filename=segment_path,
-                    output_type="console",  # or another appropriate type based on your needs
-                    output_destination=None  # or specify a file or other destination
-                )
-                validator.load()
-                validator.validate()
-                break  # Break after validating one file for demonstration
-                
-            """
-
+            self.db_manager.mark_file_as_processed(file_path)
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}")
-            continue
 
 
-def process_parquet_files(parquet_folder, output_folder):
-    logger.info(f"Processing parquet files in {parquet_folder} and saving them in {output_folder}")
-    # List all parquet files
-    parquet_files = glob.glob(os.path.join(parquet_folder, '*.parquet'))
+class DatasetBuilder:
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
 
-    # Create an empty DataFrame
-    full_df = pl.DataFrame()
+    def build_dataset(self, dataframes):
+        logger.info(f"Building dataset from dataframes and saving them in the database")
 
-    # Read file and concatenate them in a single DataFrame
-    logger.info(f"Found {len(parquet_files)} parquet files to process")
-    for file_path in parquet_files:
-        df = pl.read_parquet(file_path)
-        full_df = pl.concat([full_df, df])
-        logger.info(f"File {file_path} read successfully")
+        for df in dataframes:
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
 
-    # Convert Date to datetime - Date format is : 2021-01-01 00:00:00
-    full_df = full_df.with_columns(
-        [
-            # To datetime, the format of data is 'MM/DD/YYYY'
-            pl.col('Date').str.to_date('%m/%d/%Y').alias('Date')
-        ]
-    )
-    logger.info("Saving data to CSV files")
-    # Save month by month. name of the file should be output_{month}-{year}.csv
-    for month in full_df['Date'].dt.month().unique():
-        month_df = full_df.filter(full_df['Date'].dt.month() == month)
-        month_year = month_df['Date'].dt.strftime('%m-%Y')[0]
-        month_df.write_csv(os.path.join(output_folder, f'output_{month_year}.csv'))
-        logger.info(f"File output_{month_year}.csv saved successfully")
+        if dataframes:
+            df_concat = pd.concat(dataframes, ignore_index=True)
+            self.db_manager.store_in_db(df_concat)
 
 
-def process_for_datascience(dataset_folder, output_folder=None):
-    """
-    Process the dataset for datascience
-    :param dataset_folder: Folder containing the dataset
-    :return: None
-    """
-    logger.info(f"Processing dataset in {dataset_folder} for datascience")
-    pass
+class FileWatcher:
+    def __init__(self, directory_to_watch, focus_converter_service, dataset_builder):
+        self.DIRECTORY_TO_WATCH = directory_to_watch
+        self.focus_converter_service = focus_converter_service
+        self.dataset_builder = dataset_builder
+        self.observer = Observer()
+
+    def run(self):
+        event_handler = Handler(self.focus_converter_service, self.dataset_builder)
+        self.observer.schedule(event_handler, self.DIRECTORY_TO_WATCH, recursive=True)
+        self.observer.start()
+        try:
+            while True:
+                time.sleep(5)
+        except:
+            self.observer.stop()
+            logger.info("Observer Stopped")
+
+        self.observer.join()
 
 
-def clean_folder(folder):
-    """
-    Clean a folder by removing all files
-    :param folder:  Folder to clean
-    :return: None
-    """
-    logger.info(f"Cleaning folder {folder}")
-    files = glob.glob(os.path.join(folder, '*'))
-    for file in files:
-        os.remove(file)
+class Handler(FileSystemEventHandler):
+    def __init__(self, focus_converter_service, dataset_builder):
+        self.focus_converter_service = focus_converter_service
+        self.dataset_builder = dataset_builder
 
-    logger.info(f"Folder {folder} cleaned successfully")
+    def process(self, event):
+        if event.is_directory:
+            return None
+        elif event.event_type == 'created':
+            try:
+                logger.info(f"Received created event - {event.src_path}")
+                self.focus_converter_service.convert_csv_to_focus(event.src_path)
+                df = pd.read_csv(event.src_path)
+                self.dataset_builder.build_dataset([df])
+            except Exception as e:
+                logger.error(f"Error processing {event.src_path}: {e}")
+
+    def on_created(self, event):
+        self.process(event)
 
 
-def main():
-    logger.info("====================================")
-    logger.info("Starting data pipeline")
-    logger.info("Last update: 2024-04-24")
-    logger.info("Development phase: WIP")
-    logger.info("====================================")
-    # Create all folder if they don't exist
-    os.makedirs(input_folder, exist_ok=True)
-    os.makedirs(output_folder, exist_ok=True)
-    os.makedirs(parquet_folder, exist_ok=True)
-    os.makedirs(dataset_folder, exist_ok=True)
+class Pipeline:
+    def __init__(self, input_folder, output_folder):
+        self.input_folder = input_folder
+        self.output_folder = output_folder
+        self.db_manager = DatabaseManager()
+        self.focus_converter_service = FocusConverterService(output_folder, self.db_manager)
+        self.dataset_builder = DatasetBuilder(self.db_manager)
+        self.file_watcher = FileWatcher(input_folder, self.focus_converter_service, self.dataset_builder)
 
-    # Convert CSV to FOCUS
-    convert_csv_to_focus(input_folder, parquet_folder)
+    def process_existing_files(self):
+        logger.info("Processing existing files in the input folder")
+        csv_files = glob.glob(os.path.join(self.input_folder, '*.csv'))
+        dataframes = []
+        for file_path in csv_files:
+            try:
+                self.focus_converter_service.convert_csv_to_focus(file_path)
+                df = pd.read_csv(file_path)
+                dataframes.append(df)
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}")
+        self.dataset_builder.build_dataset(dataframes)
 
-    # Process parquet files
-    process_parquet_files(parquet_folder, dataset_folder)
+    def run(self):
+        logger.info("====================================")
+        logger.info("Starting data pipeline")
+        logger.info("Last update: 2024-05-21")
+        logger.info("Development phase: WIP")
+        logger.info("====================================")
 
-    # Clean for datascience
-    process_for_datascience(dataset_folder)
+        os.makedirs(self.input_folder, exist_ok=True)
+        os.makedirs(self.output_folder, exist_ok=True)
 
-    # Clean parquet folder
-    clean_folder(parquet_folder)
+        self.process_existing_files()
+        self.file_watcher.run()
 
 
 if __name__ == "__main__":
-    main()
+    logger = LoggerSetup.setup_logger()
+    pipeline = Pipeline(input_folder="input", output_folder="output")
+    pipeline.run()

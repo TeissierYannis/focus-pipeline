@@ -1,0 +1,4 @@
+.idea
+input/*
+output/*
+processed_files.db
