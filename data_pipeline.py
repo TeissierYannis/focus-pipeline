@@ -2,6 +2,9 @@ import os
 import glob
 import logging
 import time
+import shutil
+from abc import ABC, abstractmethod
+from threading import Thread
 
 import pandas as pd
 import sqlite3
@@ -31,12 +34,34 @@ class LoggerSetup:
         return logger
 
 
-class DatabaseManager:
+class AbstractDatabaseManager(ABC):
+    @abstractmethod
+    def init_db(self):
+        pass
+
+    @abstractmethod
+    def is_file_processed(self, file_name):
+        pass
+
+    @abstractmethod
+    def mark_file_as_processed(self, file_name):
+        pass
+
+    @abstractmethod
+    def add_missing_columns(self, df):
+        pass
+
+    @abstractmethod
+    def store_in_db(self, df):
+        pass
+
+
+class SQLiteDatabaseManager(AbstractDatabaseManager):
     def __init__(self, db_path='processed_files.db'):
         self.db_path = db_path
-        self._init_db()
+        self.init_db()
 
-    def _init_db(self):
+    def init_db(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -140,14 +165,17 @@ class DatasetBuilder:
 
 
 class FileWatcher:
-    def __init__(self, directory_to_watch, focus_converter_service, dataset_builder):
+    def __init__(self, directory_to_watch, focus_converter_service, dataset_builder, archive_folder, parquet_folder):
         self.DIRECTORY_TO_WATCH = directory_to_watch
         self.focus_converter_service = focus_converter_service
         self.dataset_builder = dataset_builder
+        self.archive_folder = archive_folder
+        self.parquet_folder = parquet_folder
         self.observer = Observer()
 
     def run(self):
-        event_handler = Handler(self.focus_converter_service, self.dataset_builder)
+        event_handler = Handler(self.focus_converter_service, self.dataset_builder, self.archive_folder,
+                                self.parquet_folder)
         self.observer.schedule(event_handler, self.DIRECTORY_TO_WATCH, recursive=True)
         self.observer.start()
         try:
@@ -161,34 +189,51 @@ class FileWatcher:
 
 
 class Handler(FileSystemEventHandler):
-    def __init__(self, focus_converter_service, dataset_builder):
+    def __init__(self, focus_converter_service, dataset_builder, archive_folder, parquet_folder):
         self.focus_converter_service = focus_converter_service
         self.dataset_builder = dataset_builder
+        self.archive_folder = archive_folder
+        self.parquet_folder = parquet_folder
 
-    def process(self, event):
-        if event.is_directory:
-            return None
-        elif event.event_type == 'created':
-            try:
-                logger.info(f"Received created event - {event.src_path}")
-                self.focus_converter_service.convert_csv_to_focus(event.src_path)
-                df = pd.read_csv(event.src_path)
-                self.dataset_builder.build_dataset([df])
-            except Exception as e:
-                logger.error(f"Error processing {event.src_path}: {e}")
+    def process(self, file_path):
+        try:
+            logger.info(f"Processing file - {file_path}")
+            self.focus_converter_service.convert_csv_to_focus(file_path)
+            df = pd.read_csv(file_path)
+            self.dataset_builder.build_dataset([df])
+            self.archive_file(file_path)
+            self.clean_parquet_folder()
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}")
 
     def on_created(self, event):
-        self.process(event)
+        if not event.is_directory:
+            Thread(target=self.process, args=(event.src_path,)).start()
+
+    def archive_file(self, file_path):
+        if not os.path.exists(self.archive_folder):
+            os.makedirs(self.archive_folder)
+        shutil.move(file_path, os.path.join(self.archive_folder, os.path.basename(file_path)))
+        logger.info(f"Archived file {file_path} to {self.archive_folder}")
+
+    def clean_parquet_folder(self):
+        files = glob.glob(os.path.join(self.parquet_folder, '*.parquet'))
+        for file in files:
+            os.remove(file)
+        logger.info(f"Cleaned parquet folder {self.parquet_folder}")
 
 
 class Pipeline:
-    def __init__(self, input_folder, output_folder):
+    def __init__(self, input_folder, output_folder, archive_folder, parquet_folder):
         self.input_folder = input_folder
         self.output_folder = output_folder
-        self.db_manager = DatabaseManager()
+        self.archive_folder = archive_folder
+        self.parquet_folder = parquet_folder
+        self.db_manager = SQLiteDatabaseManager()
         self.focus_converter_service = FocusConverterService(output_folder, self.db_manager)
         self.dataset_builder = DatasetBuilder(self.db_manager)
-        self.file_watcher = FileWatcher(input_folder, self.focus_converter_service, self.dataset_builder)
+        self.file_watcher = FileWatcher(input_folder, self.focus_converter_service, self.dataset_builder,
+                                        archive_folder, parquet_folder)
 
     def process_existing_files(self):
         logger.info("Processing existing files in the input folder")
@@ -199,25 +244,40 @@ class Pipeline:
                 self.focus_converter_service.convert_csv_to_focus(file_path)
                 df = pd.read_csv(file_path)
                 dataframes.append(df)
+                self.archive_file(file_path)
             except Exception as e:
                 logger.error(f"Error processing {file_path}: {e}")
         self.dataset_builder.build_dataset(dataframes)
+        self.clean_parquet_folder()
+
+    def archive_file(self, file_path):
+        if not os.path.exists(self.archive_folder):
+            os.makedirs(self.archive_folder)
+        shutil.move(file_path, os.path.join(self.archive_folder, os.path.basename(file_path)))
+        logger.info(f"Archived file {file_path} to {self.archive_folder}")
+
+    def clean_parquet_folder(self):
+        files = glob.glob(os.path.join(self.parquet_folder, '*.parquet'))
+        for file in files:
+            os.remove(file)
+        logger.info(f"Cleaned parquet folder {self.parquet_folder}")
 
     def run(self):
         logger.info("====================================")
         logger.info("Starting data pipeline")
-        logger.info("Last update: 2024-05-21")
+        logger.info("Last update: 2024-04-24")
         logger.info("Development phase: WIP")
         logger.info("====================================")
 
         os.makedirs(self.input_folder, exist_ok=True)
         os.makedirs(self.output_folder, exist_ok=True)
-
+        os.makedirs(self.archive_folder, exist_ok=True)
+        os.makedirs(self.parquet_folder, exist_ok=True)
         self.process_existing_files()
         self.file_watcher.run()
 
 
 if __name__ == "__main__":
     logger = LoggerSetup.setup_logger()
-    pipeline = Pipeline(input_folder="input", output_folder="output")
+    pipeline = Pipeline('input', 'output', 'archive', 'parquet')
     pipeline.run()

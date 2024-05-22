@@ -1,7 +1,7 @@
 
 # Data Pipeline for Cloud Provider Exports
 
-This Python script processes export files from cloud providers, such as Azure, converting them to the FOCUS format for further analysis. It handles data from input CSV files, converts them into Parquet format, processes these files to extract datasets month by month, and prepares them for data science purposes.
+This Python script processes exported files from cloud providers, such as Azure, converting them to the FOCUS format for further analysis. It handles data from input CSV files, converts them into a specified format, processes these files to extract datasets, and prepares them for data science purposes. The script also archives processed files and cleans up intermediate files to maintain an organized workspace.
 
 ## Prerequisites
 
@@ -40,13 +40,23 @@ The script includes detailed logging that helps in tracing the processing steps 
 ## Folder Structure
 
 - `input/`: Place your CSV files here.
-- `output/`: Contains converted Parquet files and final CSV datasets.
 - `output/parquet/`: Intermediate folder for Parquet files.
-- `output/dataset/`: Contains the final datasets ready for data science analysis.
+- `output/archive/`: Contains archived original CSV files after processing.
 
-## Cleaning Up
+## Features
 
-After processing, the script cleans the intermediate Parquet files to free up space and avoid clutter.
+- Uses focus-converter module for data conversion. 
+- Processes files in real-time as they are added to the input directory. 
+- Detailed logging with timestamps, module names, severity levels, and messages. 
+- Partial skips already processed files to avoid redundant processing. (based on file names) 
+- Archives processed CSV files to a designated archive folder. 
+- Cleans up intermediate Parquet files to free up space. 
+- Flexible database management using an abstract class for potential future database changes. 
+- Initial processing of existing files in the input folder upon script start.
+- Threading for handling multiple file processing simultaneously. 
+- Automatic addition of missing columns to the database schema. 
+- Stores processed data in an SQLite database. 
+- Customizable folder paths for input, output, archive, and intermediate files.
 
 ## Contributing
 
