@@ -55,6 +55,10 @@ class AbstractDatabaseManager(ABC):
     def store_in_db(self, df):
         pass
 
+    @abstractmethod
+    def store_raw_data(self, df, file_name):
+        pass
+
 
 class SQLiteDatabaseManager(AbstractDatabaseManager):
     def __init__(self, db_path='processed_files.db'):
@@ -73,6 +77,13 @@ class SQLiteDatabaseManager(AbstractDatabaseManager):
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS dataset (
             id INTEGER PRIMARY KEY AUTOINCREMENT
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS raw_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT,
+            data BLOB
         )
         ''')
         conn.commit()
@@ -110,6 +121,13 @@ class SQLiteDatabaseManager(AbstractDatabaseManager):
         conn = sqlite3.connect(self.db_path)
         self.add_missing_columns(df)
         df.to_sql('dataset', conn, if_exists='append', index=False)
+        conn.close()
+
+    def store_raw_data(self, df, file_name):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO raw_data (file_name, data) VALUES (?, ?)', (file_name, df.to_csv(index=False)))
+        conn.commit()
         conn.close()
 
 
@@ -198,8 +216,9 @@ class Handler(FileSystemEventHandler):
     def process(self, file_path):
         try:
             logger.info(f"Processing file - {file_path}")
-            self.focus_converter_service.convert_csv_to_focus(file_path)
             df = pd.read_csv(file_path)
+            self.focus_converter_service.db_manager.store_raw_data(df, file_path)
+            self.focus_converter_service.convert_csv_to_focus(file_path)
             self.dataset_builder.build_dataset([df])
             self.archive_file(file_path)
             self.clean_parquet_folder()
@@ -241,8 +260,9 @@ class Pipeline:
         dataframes = []
         for file_path in csv_files:
             try:
-                self.focus_converter_service.convert_csv_to_focus(file_path)
                 df = pd.read_csv(file_path)
+                self.focus_converter_service.db_manager.store_raw_data(df, file_path)
+                self.focus_converter_service.convert_csv_to_focus(file_path)
                 dataframes.append(df)
                 self.archive_file(file_path)
             except Exception as e:
@@ -261,6 +281,7 @@ class Pipeline:
         for file in files:
             os.remove(file)
         logger.info(f"Cleaned parquet folder {self.parquet_folder}")
+
 
     def run(self):
         logger.info("====================================")

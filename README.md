@@ -57,6 +57,7 @@ The script includes detailed logging that helps in tracing the processing steps 
 - Automatic addition of missing columns to the database schema. 
 - Stores processed data in an SQLite database. 
 - Customizable folder paths for input, output, archive, and intermediate files.
+- Store Raw Data in database
 
 ## Contributing
 
